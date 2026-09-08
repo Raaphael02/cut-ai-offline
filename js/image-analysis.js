@@ -40,17 +40,25 @@ const ImageAnalysis = {
             // Extract image data
             const imageData = ctx.getImageData(0, 0, width, height);
             
-            // Perform local analysis
+            // Perform comprehensive local analysis
+            const edges = this.detectEdges(imageData, width, height);
+            const contours = this.detectContours(imageData, width, height);
+            const shapes = this.detectShapes(contours, width, height);
+            
             const analysis = {
                 objectType: this.detectObjectType(imageData, width, height),
-                shapes: this.detectShapes(imageData, width, height),
-                edges: this.detectEdges(imageData, width, height),
+                shapes: shapes,
+                edges: edges,
+                contours: contours,
                 symmetry: this.detectSymmetry(imageData, width, height),
-                components: this.detectComponents(imageData, width, height),
+                components: this.detectComponentsFromContours(contours, shapes, imageData, width, height),
                 dominantColors: this.extractDominantColors(imageData),
                 brightness: this.analyzeBrightness(imageData),
                 contrast: this.analyzeContrast(imageData),
-                complexity: this.analyzeComplexity(imageData, width, height)
+                complexity: this.analyzeComplexity(imageData, width, height),
+                edgeMap: edges.map,
+                imageWidth: width,
+                imageHeight: height
             };
 
             return analysis;
@@ -60,10 +68,244 @@ const ImageAnalysis = {
         }
     },
 
+    // Verbesserte Kantenerkennung mit Sobel-Filter
+    detectEdges(imageData, width, height) {
+        const data = imageData.data;
+        const edgeMap = new Uint8Array(width * height);
+        let edgeCount = 0;
+        let maxEdge = 0;
+
+        // Sobel edge detection
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                // Sobel X
+                const sobelX = 
+                    -this.getBrightness(data, width, x - 1, y - 1) - 2 * this.getBrightness(data, width, x - 1, y) - this.getBrightness(data, width, x - 1, y + 1) +
+                    this.getBrightness(data, width, x + 1, y - 1) + 2 * this.getBrightness(data, width, x + 1, y) + this.getBrightness(data, width, x + 1, y + 1);
+
+                // Sobel Y
+                const sobelY = 
+                    -this.getBrightness(data, width, x - 1, y - 1) - 2 * this.getBrightness(data, width, x, y - 1) - this.getBrightness(data, width, x + 1, y - 1) +
+                    this.getBrightness(data, width, x - 1, y + 1) + 2 * this.getBrightness(data, width, x, y + 1) + this.getBrightness(data, width, x + 1, y + 1);
+
+                const magnitude = Math.sqrt(sobelX * sobelX + sobelY * sobelY);
+                edgeMap[y * width + x] = Math.min(255, magnitude / 4);
+
+                if (magnitude > 40) {
+                    edgeCount++;
+                    maxEdge = Math.max(maxEdge, magnitude);
+                }
+            }
+        }
+
+        const edgeDensity = edgeCount / (width * height);
+        
+        return {
+            detected: edgeCount > 0,
+            edgeCount: edgeCount,
+            density: edgeDensity,
+            quality: edgeDensity > 0.1 ? 'hoch' : edgeDensity > 0.05 ? 'mittel' : 'niedrig',
+            map: edgeMap,
+            maxMagnitude: maxEdge
+        };
+    },
+
+    // Konturerkennung
+    detectContours(imageData, width, height) {
+        const data = imageData.data;
+        const contours = [];
+        const visited = new Set();
+        
+        // Schwellenwert für Kantenerkennung
+        const threshold = 100;
+        
+        // Finde alle Kantenpixel
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                const idx = (y * width + x) * 4;
+                const r = data[idx];
+                const g = data[idx + 1];
+                const b = data[idx + 2];
+                const brightness = (r + g + b) / 3;
+                
+                // Prüfe auf Kontrast zu Nachbarn
+                let hasContrast = false;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nidx = ((y + dy) * width + (x + dx)) * 4;
+                        const nb = (data[nidx] + data[nidx + 1] + data[nidx + 2]) / 3;
+                        if (Math.abs(brightness - nb) > threshold) {
+                            hasContrast = true;
+                            break;
+                        }
+                    }
+                    if (hasContrast) break;
+                }
+                
+                if (hasContrast) {
+                    const key = `${x},${y}`;
+                    if (!visited.has(key)) {
+                        visited.add(key);
+                        contours.push({ x, y, brightness });
+                    }
+                }
+            }
+        }
+        
+        return contours;
+    },
+
+    // Erkenne Formen aus Konturen
+    detectShapes(contours, width, height) {
+        const shapes = [];
+        
+        if (contours.length < 10) {
+            return shapes;
+        }
+        
+        // Gruppiere Konturen in Clustern
+        const clusters = this.clusterPoints(contours, 50);
+        
+        clusters.forEach(cluster => {
+            if (cluster.length < 5) return;
+            
+            // Berechne Bounding Box
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            
+            cluster.forEach(p => {
+                minX = Math.min(minX, p.x);
+                maxX = Math.max(maxX, p.x);
+                minY = Math.min(minY, p.y);
+                maxY = Math.max(maxY, p.y);
+            });
+            
+            const w = maxX - minX;
+            const h = maxY - minY;
+            const aspect = w / Math.max(h, 1);
+            
+            let shapeType = 'Unbekannt';
+            let confidence = 0.4;
+            
+            // Erkenne Formtyp
+            if (aspect > 0.7 && aspect < 1.3) {
+                shapeType = 'Rechteck';
+                confidence = 0.7;
+            } else if (aspect > 1.5) {
+                shapeType = 'Horizontale Struktur';
+                confidence = 0.6;
+            } else if (aspect < 0.67) {
+                shapeType = 'Vertikale Struktur';
+                confidence = 0.6;
+            }
+            
+            shapes.push({
+                type: shapeType,
+                x: minX,
+                y: minY,
+                width: w,
+                height: h,
+                area: w * h,
+                confidence: confidence,
+                pointCount: cluster.length
+            });
+        });
+        
+        // Sortiere nach Größe
+        shapes.sort((a, b) => b.area - a.area);
+        
+        return shapes.slice(0, 10); // Max 10 Formen
+    },
+
+    // Clustering-Hilfsfunktion
+    clusterPoints(points, maxDistance) {
+        const clusters = [];
+        const used = new Set();
+        
+        for (let i = 0; i < points.length; i++) {
+            if (used.has(i)) continue;
+            
+            const cluster = [points[i]];
+            used.add(i);
+            
+            for (let j = i + 1; j < points.length; j++) {
+                if (used.has(j)) continue;
+                
+                const dist = Math.hypot(
+                    points[i].x - points[j].x,
+                    points[i].y - points[j].y
+                );
+                
+                if (dist < maxDistance) {
+                    cluster.push(points[j]);
+                    used.add(j);
+                }
+            }
+            
+            if (cluster.length > 0) {
+                clusters.push(cluster);
+            }
+        }
+        
+        return clusters;
+    },
+
+    // Erkenne Komponenten basierend auf erkannten Konturen
+    detectComponentsFromContours(contours, shapes, imageData, width, height) {
+        const components = [];
+        
+        const componentNames = [
+            'Äußeres Gehäuse',
+            'Inneres Modul',
+            'Strukturelement',
+            'Interne Komponente',
+            'Verbindungselement',
+            'Schichten-Grenze',
+            'Technisches Element',
+            'Strukturteil',
+            'Elektronisches Element',
+            'Mechanisches Teil'
+        ];
+        
+        // Nutze erkannte Formen als Basis für Komponenten
+        shapes.slice(0, 5).forEach((shape, idx) => {
+            // Konfidenz basierend auf erkannter Formgröße und Punktanzahl
+            const sizeConfidence = Math.min(shape.area / (width * height), 1);
+            const densityConfidence = Math.min(shape.pointCount / 100, 1);
+            const confidence = Math.max(0.3, (sizeConfidence + densityConfidence) / 2 * 0.9);
+            
+            components.push({
+                name: componentNames[idx % componentNames.length],
+                description: `${shape.type} - Erkannte innere Komponente`,
+                confidence: confidence,
+                region: idx,
+                x: (shape.x + shape.width / 2) / width,
+                y: (shape.y + shape.height / 2) / height,
+                shape: shape
+            });
+        });
+        
+        // Fallback: Wenn keine Formen erkannt wurden, generiere basierend auf Konturen
+        if (components.length === 0 && contours.length > 0) {
+            const avgConfidence = Math.min(contours.length / 200, 0.9);
+            components.push({
+                name: 'Erkannte Struktur',
+                description: 'Komplexe innere Struktur basierend auf Konturen',
+                confidence: avgConfidence,
+                region: 0,
+                x: 0.5,
+                y: 0.5
+            });
+        }
+        
+        return components;
+    },
+
     detectObjectType(imageData, width, height) {
         const data = imageData.data;
         let edgePixels = 0;
         let darkPixels = 0;
+        let brightPixels = 0;
         let totalPixels = data.length / 4;
 
         for (let i = 0; i < data.length; i += 4) {
@@ -72,112 +314,32 @@ const ImageAnalysis = {
             const b = data[i + 2];
             const brightness = (r + g + b) / 3;
 
-            if (brightness < 100) darkPixels++;
-            if (brightness > 200 && brightness < 50) edgePixels++;
+            if (brightness < 80) darkPixels++;
+            else if (brightness > 200) brightPixels++;
         }
 
         const darkRatio = darkPixels / totalPixels;
-        const edgeRatio = edgePixels / totalPixels;
+        const brightRatio = brightPixels / totalPixels;
 
-        let objectType = 'Objekt';
-        let confidence = 0.5;
+        let objectType = 'Technisches Objekt';
+        let confidence = 0.6;
 
-        if (darkRatio > 0.3 && edgeRatio > 0.1) {
-            objectType = 'Technisches Gerät';
+        if (darkRatio > 0.4) {
+            objectType = 'Elektronisches/dunkles Gerät';
+            confidence = 0.7;
+        } else if (brightRatio > 0.5) {
+            objectType = 'Helles/transparentes Objekt';
             confidence = 0.65;
-        } else if (darkRatio > 0.4) {
-            objectType = 'Mechanisches Bauteil';
-            confidence = 0.60;
-        } else if (darkRatio < 0.2) {
-            objectType = 'Elektronisches Gerät';
-            confidence = 0.55;
+        } else if (darkRatio > 0.2 && brightRatio > 0.2) {
+            objectType = 'Gemischtes technisches Gerät';
+            confidence = 0.65;
         }
 
         return {
             type: objectType,
             confidence: confidence,
             darkRatio: darkRatio,
-            edgeRatio: edgeRatio
-        };
-    },
-
-    detectShapes(imageData, width, height) {
-        const data = imageData.data;
-        const shapes = [];
-
-        // Detect rectangular shapes
-        let rectCount = 0;
-        let circleCount = 0;
-
-        // Simple heuristic: scan for corner-like patterns
-        for (let y = 10; y < height - 10; y += 20) {
-            for (let x = 10; x < width - 10; x += 20) {
-                const idx = (y * width + x) * 4;
-                const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-
-                if (brightness < 150) {
-                    // Check for corner pattern
-                    const upLeftIdx = ((y - 5) * width + (x - 5)) * 4;
-                    const upRightIdx = ((y - 5) * width + (x + 5)) * 4;
-                    const downLeftIdx = ((y + 5) * width + (x - 5)) * 4;
-                    const downRightIdx = ((y + 5) * width + (x + 5)) * 4;
-
-                    const upLeft = (data[upLeftIdx] + data[upLeftIdx + 1] + data[upLeftIdx + 2]) / 3;
-                    const upRight = (data[upRightIdx] + data[upRightIdx + 1] + data[upRightIdx + 2]) / 3;
-                    const downLeft = (data[downLeftIdx] + data[downLeftIdx + 1] + data[downLeftIdx + 2]) / 3;
-                    const downRight = (data[downRightIdx] + data[downRightIdx + 1] + data[downRightIdx + 2]) / 3;
-
-                    const cornerContrast = Math.abs(upLeft - downRight) + Math.abs(upRight - downLeft);
-                    if (cornerContrast > 100) {
-                        rectCount++;
-                    }
-                }
-            }
-        }
-
-        shapes.push({
-            type: 'Rechteck/Box',
-            count: rectCount,
-            confidence: Math.min(0.3 + (rectCount / 100), 0.9)
-        });
-
-        return shapes;
-    },
-
-    detectEdges(imageData, width, height) {
-        const data = imageData.data;
-        let edgeCount = 0;
-        let totalEdgeLength = 0;
-
-        // Sobel edge detection (simplified)
-        for (let y = 1; y < height - 1; y++) {
-            for (let x = 1; x < width - 1; x++) {
-                const idx = (y * width + x) * 4;
-                
-                // Simplified Sobel
-                const center = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-                const neighbors = [];
-                
-                for (let dy = -1; dy <= 1; dy++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        const nIdx = ((y + dy) * width + (x + dx)) * 4;
-                        neighbors.push((data[nIdx] + data[nIdx + 1] + data[nIdx + 2]) / 3);
-                    }
-                }
-
-                const edgeStrength = Math.abs(Math.max(...neighbors) - Math.min(...neighbors));
-                if (edgeStrength > 50) {
-                    edgeCount++;
-                    totalEdgeLength += edgeStrength / 255;
-                }
-            }
-        }
-
-        return {
-            detected: edgeCount > 0,
-            edgeCount: edgeCount,
-            totalLength: totalEdgeLength,
-            density: edgeCount / (width * height)
+            brightRatio: brightRatio
         };
     },
 
@@ -193,11 +355,8 @@ const ImageAnalysis = {
             const midX = width / 2;
 
             for (let x = 0; x < midX; x += Math.floor(midX / 10)) {
-                const leftIdx = (y * width + Math.floor(x)) * 4;
-                const rightIdx = (y * width + Math.floor(width - x - 1)) * 4;
-
-                const leftB = (data[leftIdx] + data[leftIdx + 1] + data[leftIdx + 2]) / 3;
-                const rightB = (data[rightIdx] + data[rightIdx + 1] + data[rightIdx + 2]) / 3;
+                const leftB = this.getBrightness(data, width, Math.floor(x), y);
+                const rightB = this.getBrightness(data, width, Math.floor(width - x - 1), y);
 
                 if (Math.abs(leftB - rightB) < 30) {
                     horizontalSymmetry++;
@@ -211,11 +370,8 @@ const ImageAnalysis = {
             const midY = height / 2;
 
             for (let y = 0; y < midY; y += Math.floor(midY / 10)) {
-                const topIdx = (Math.floor(y) * width + x) * 4;
-                const bottomIdx = ((height - Math.floor(y) - 1) * width + x) * 4;
-
-                const topB = (data[topIdx] + data[topIdx + 1] + data[topIdx + 2]) / 3;
-                const bottomB = (data[bottomIdx] + data[bottomIdx + 1] + data[bottomIdx + 2]) / 3;
+                const topB = this.getBrightness(data, width, x, Math.floor(y));
+                const bottomB = this.getBrightness(data, width, x, Math.floor(height - y - 1));
 
                 if (Math.abs(topB - bottomB) < 30) {
                     verticalSymmetry++;
@@ -228,69 +384,6 @@ const ImageAnalysis = {
             vertical: Math.min(verticalSymmetry / (samples * 10), 1),
             isSymmetric: horizontalSymmetry > samples * 3 || verticalSymmetry > samples * 3
         };
-    },
-
-    detectComponents(imageData, width, height) {
-        const data = imageData.data;
-        const components = [];
-
-        // Detect potential internal components based on contrast regions
-        let regionCount = 0;
-        const regionSize = 32;
-
-        for (let y = 0; y < height; y += regionSize) {
-            for (let x = 0; x < width; x += regionSize) {
-                let minB = 255;
-                let maxB = 0;
-                let avgB = 0;
-                let pixelCount = 0;
-
-                for (let dy = 0; dy < regionSize && y + dy < height; dy++) {
-                    for (let dx = 0; dx < regionSize && x + dx < width; dx++) {
-                        const idx = ((y + dy) * width + (x + dx)) * 4;
-                        const brightness = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-                        minB = Math.min(minB, brightness);
-                        maxB = Math.max(maxB, brightness);
-                        avgB += brightness;
-                        pixelCount++;
-                    }
-                }
-
-                avgB /= pixelCount;
-                const contrast = maxB - minB;
-
-                if (contrast > 50 && avgB < 200) {
-                    regionCount++;
-                }
-            }
-        }
-
-        // Generate plausible component names based on detected regions
-        const componentNames = [
-            'Gehäuse',
-            'Elektronikplatine',
-            'Akku',
-            'Motor',
-            'Kühlkörper',
-            'Transformator',
-            'Spule',
-            'Kondensator',
-            'Lager',
-            'Schraube'
-        ];
-
-        const estimatedComponents = Math.max(1, Math.min(regionCount / 4, componentNames.length));
-
-        for (let i = 0; i < Math.floor(estimatedComponents); i++) {
-            const confidence = 0.4 + Math.random() * 0.4;
-            components.push({
-                name: componentNames[i % componentNames.length],
-                confidence: confidence,
-                region: i
-            });
-        }
-
-        return components;
     },
 
     extractDominantColors(imageData) {
@@ -362,7 +455,6 @@ const ImageAnalysis = {
             lastB = brightness;
         }
 
-        // Normalize to 0-1
         const complexity = Math.min(transitions / (width * height), 1);
 
         return {
@@ -371,24 +463,31 @@ const ImageAnalysis = {
         };
     },
 
+    // Hilfsfunktion für Helligkeit
+    getBrightness(data, width, x, y) {
+        const idx = (y * width + x) * 4;
+        return (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
+    },
+
     recommendCutType(analysis) {
         if (!analysis) return 'auto';
 
         const symmetry = analysis.symmetry || {};
         const complexity = analysis.complexity || {};
+        const contourCount = (analysis.contours || []).length;
 
         if (symmetry.isSymmetric) {
-            return 'half'; // Halbschnitt for symmetrical objects
+            return 'half';
         }
 
-        if (complexity.level === 'Komplex') {
-            return 'cutaway'; // Cutaway for complex objects
+        if (complexity.level === 'Komplex' && contourCount > 100) {
+            return 'cutaway';
         }
 
-        if (analysis.components && analysis.components.length > 5) {
-            return 'layers'; // Schichtaufbau for many components
+        if ((analysis.components || []).length > 5) {
+            return 'layers';
         }
 
-        return 'cross'; // Default to cross section
+        return 'cross';
     }
 };
