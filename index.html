@@ -237,5 +237,35 @@
     <script src="js/renderer.js"></script>
     <script src="js/ai.js"></script>
     <script src="js/app.js"></script>
+
+    <!-- Service Worker Registration -->
+    <script>
+        // Register Service Worker for offline support
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('sw.js')
+                    .then(registration => {
+                        console.log('Service Worker registered successfully:', registration);
+                    })
+                    .catch(error => {
+                        console.warn('Service Worker registration failed:', error);
+                    });
+            });
+
+            // Handle Service Worker updates
+            navigator.serviceWorker.addEventListener('controllerchange', () => {
+                console.log('Service Worker has been updated');
+            });
+        } else {
+            console.warn('Service Worker not supported in this browser');
+        }
+
+        // Prevent pinch zoom on mobile
+        document.addEventListener('touchmove', (e) => {
+            if (e.scale !== 1) {
+                e.preventDefault();
+            }
+        }, { passive: false });
+    </script>
 </body>
 </html>
